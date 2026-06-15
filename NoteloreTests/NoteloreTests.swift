@@ -8,10 +8,6 @@
 import Testing
 @testable import Notelore
 
-struct NoteloreTests {
-
-    @Test func example() async throws {
-        // Write your test here and use APIs like `#expect(...)` to check expected conditions.
-    }
-
+@Test func appModuleLoads() {
+    #expect(Bool(true))
 }
