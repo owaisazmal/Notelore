@@ -81,17 +81,21 @@ enum SearchRanker {
     /// A short window of transcript (or summary) around the first match.
     static func snippet(tokens: [String], in doc: SearchDocument, radius: Int = 60) -> String {
         let source = doc.body.isEmpty ? doc.summary : doc.body
-        let lowered = source.lowercased()
-        guard let token = tokens.first(where: { lowered.contains($0) }),
-              let match = lowered.range(of: token)
+        // Match case-insensitively against `source` itself; tokens are already
+        // lowercased. Working on `source` (never a separate lowercased copy)
+        // keeps every index valid for slicing — lowercasing can change string
+        // length for some scripts and would invalidate cross-string indices.
+        guard let match = tokens.lazy
+            .compactMap({ source.range(of: $0, options: .caseInsensitive) })
+            .first
         else {
             return String(source.prefix(radius * 2))
         }
-        let start = lowered.index(match.lowerBound, offsetBy: -radius, limitedBy: lowered.startIndex) ?? lowered.startIndex
-        let end = lowered.index(match.upperBound, offsetBy: radius, limitedBy: lowered.endIndex) ?? lowered.endIndex
+        let start = source.index(match.lowerBound, offsetBy: -radius, limitedBy: source.startIndex) ?? source.startIndex
+        let end = source.index(match.upperBound, offsetBy: radius, limitedBy: source.endIndex) ?? source.endIndex
         var clip = String(source[start..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
-        if start > lowered.startIndex { clip = "…" + clip }
-        if end < lowered.endIndex { clip += "…" }
+        if start > source.startIndex { clip = "…" + clip }
+        if end < source.endIndex { clip += "…" }
         return clip
     }
 }

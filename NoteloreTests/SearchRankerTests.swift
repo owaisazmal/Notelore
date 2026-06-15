@@ -217,4 +217,18 @@ import Testing
         #expect(!snippet.contains("absent"))
         #expect(snippet.contains("short body"))
     }
+
+    @Test func snippetSurvivesNonASCIIBodyWithoutCrashing() {
+        // A body whose lowercasing changes character boundaries/length (the
+        // Turkish dotted capital İ expands to two scalars when lowercased).
+        // snippet() must index the original string, never a lowercased copy.
+        let lead = String(repeating: "İ", count: 80)
+        let tail = String(repeating: "Ş", count: 80)
+        let body = lead + " RÉSUMÉ café déjà vu " + tail
+        let document = doc(title: "t", body: body)
+
+        // tokenize lowercases, so the stored token is the lowercased form.
+        let snippet = SearchRanker.snippet(tokens: SearchRanker.tokenize("RÉSUMÉ"), in: document)
+        #expect(snippet.localizedCaseInsensitiveContains("résumé"))
+    }
 }

@@ -55,6 +55,13 @@ final class AskModel {
         hasKey = services.keychain.apiKey(for: .gemini) != nil
     }
 
+    /// Tear down any in-flight stream when the screen goes away, so the
+    /// network request (and the key owner's quota) isn't spent in the background.
+    func cancel() {
+        askTask?.cancel()
+        askTask = nil
+    }
+
     func ask() {
         let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }

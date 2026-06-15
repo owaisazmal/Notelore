@@ -177,6 +177,7 @@ final class AudioEngineRecorder: AudioRecordingService {
         do {
             try engine.start()
         } catch {
+            removeTap()
             teardownEngine()
             fileBox.set(nil)
             AudioStorage.delete(fileName: name)
@@ -266,6 +267,28 @@ final class AudioEngineRecorder: AudioRecordingService {
         tapInstalled = false
     }
 
+    /// Re-points the input tap (and any needed format converter) at the
+    /// hardware's current input format. Safe whether or not the engine is
+    /// running — the caller owns engine start/stop around this. Used on every
+    /// restart (resume, interruption-end) and on route changes, so the tap and
+    /// converter always match the live input even if it changed while paused.
+    private func reconcileInputFormat() {
+        removeTap()
+        let newFormat = engine.inputNode.outputFormat(forBus: 0)
+        if let fileFormat = fileProcessingFormat, fileFormat != newFormat {
+            if let converter = AVAudioConverter(from: newFormat, to: fileFormat) {
+                converterBox.set(converter)
+            } else {
+                converterBox.set(nil)
+                // Keep already-written audio; surface one failure, continue.
+                yield(.failed(message: "The new microphone format could not be matched."))
+            }
+        } else {
+            converterBox.set(nil)
+        }
+        installTap(format: newFormat)
+    }
+
     // MARK: - Pause / Resume
 
     func pause() {
@@ -279,6 +302,9 @@ final class AudioEngineRecorder: AudioRecordingService {
 
     func resume() throws {
         guard state == .paused || state == .interrupted else { return }
+        // The input route may have changed while paused; re-point the tap at
+        // the current hardware format before restarting.
+        reconcileInputFormat()
         do {
             try engine.start()
         } catch {
@@ -456,6 +482,9 @@ final class AudioEngineRecorder: AudioRecordingService {
             }
             if shouldResume {
                 try? AVAudioSession.sharedInstance().setActive(true)
+                // The route/format may have changed during the interruption
+                // (a call may have connected AirPods); reconcile before restart.
+                reconcileInputFormat()
                 do {
                     try engine.start()
                     activeFlag.withLock { $0 = true }
@@ -484,30 +513,17 @@ final class AudioEngineRecorder: AudioRecordingService {
         else { return }
 
         guard reason == .newDeviceAvailable || reason == .oldDeviceUnavailable else { return }
-        guard state == .recording else { return }
+        // Handle the change whether recording or paused/interrupted, so a tap
+        // bound to the old format is never carried into a later resume.
+        guard state == .recording || state == .paused || state == .interrupted else { return }
 
         let wasRunning = engine.isRunning
         if wasRunning { engine.pause() }
-        removeTap()
 
-        let newFormat = engine.inputNode.outputFormat(forBus: 0)
+        reconcileInputFormat()
 
-        // Decide whether the new input format needs converting into the file's
-        // processing format.
-        if let fileFormat = fileProcessingFormat, fileFormat != newFormat {
-            if let converter = AVAudioConverter(from: newFormat, to: fileFormat) {
-                converterBox.set(converter)
-            } else {
-                converterBox.set(nil)
-                // Keep already-written audio; surface one failure, continue.
-                yield(.failed(message: "The new microphone format could not be matched."))
-            }
-        } else {
-            converterBox.set(nil)
-        }
-
-        installTap(format: newFormat)
-
+        // Only restart if we were actively running; a paused/interrupted
+        // recording stays paused with its tap now matching the new input.
         if wasRunning {
             try? engine.start()
         }

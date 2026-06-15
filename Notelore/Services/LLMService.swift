@@ -62,7 +62,7 @@ enum LLMError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .missingKey:
-            return "Add your Gemini key in Settings to have minutes written for you."
+            return "Add your key in Settings to have minutes written for you."
         case .invalidKey:
             return "That key wasn't accepted. You can check it in Settings."
         case .rateLimited(let seconds):

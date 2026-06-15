@@ -253,7 +253,7 @@ final class RecordModel {
 
         var footnote: String?
         if services.keychain.apiKey(for: .gemini) == nil {
-            footnote = "Saved. Add your Gemini key in Settings to have minutes written."
+            footnote = "Saved. Add your key in Settings to have minutes written."
         } else if !utterances.isEmpty {
             savingMessage = "Writing the minutes…"
             do {

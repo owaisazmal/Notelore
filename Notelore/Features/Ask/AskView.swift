@@ -26,6 +26,7 @@ struct AskView: View {
             .navigationTitle("Ask the lore")
         }
         .onAppear { model.refresh() }
+        .onDisappear { model.cancel() }
     }
 
     // MARK: Layout
@@ -73,7 +74,7 @@ struct AskView: View {
     @ViewBuilder
     private var resultArea: some View {
         if !model.hasKey {
-            Text("Add your Gemini key in Settings to ask the lore.")
+            Text("Add your key in Settings to ask the lore.")
                 .font(.nlProse)
                 .foregroundStyle(Color.inkMuted)
                 .padding(.top, 8)

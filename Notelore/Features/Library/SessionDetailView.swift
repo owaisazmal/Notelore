@@ -30,11 +30,7 @@ struct SessionDetailView: View {
                 if sizeClass == .regular {
                     splitPanes
                 } else {
-                    Picker("View", selection: $pane) {
-                        Text("Minutes").tag(Pane.minutes)
-                        Text("Transcript").tag(Pane.transcript)
-                    }
-                    .pickerStyle(.segmented)
+                    paneToggle
 
                     switch pane {
                     case .minutes:
@@ -60,6 +56,33 @@ struct SessionDetailView: View {
                     Image(systemName: "square.and.arrow.up")
                 }
             }
+        }
+    }
+
+    // MARK: Pane toggle
+
+    /// A flat, paper toggle between Minutes and Transcript: small-caps labels
+    /// over a 1px ink underline that marks the active pane. No system chrome.
+    private var paneToggle: some View {
+        HStack(spacing: 28) {
+            ForEach([Pane.minutes, Pane.transcript], id: \.self) { item in
+                Button {
+                    withAnimation(Theme.fade) { pane = item }
+                } label: {
+                    VStack(spacing: 6) {
+                        Text(item == .minutes ? "Minutes" : "Transcript")
+                            .font(.nlLabel)
+                            .tracking(1.4)
+                            .foregroundStyle(pane == item ? Color.ink : Color.inkMuted)
+                        Rectangle()
+                            .fill(pane == item ? Color.ink : Color.clear)
+                            .frame(height: Theme.hairline)
+                    }
+                    .fixedSize()
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer(minLength: 0)
         }
     }
 

@@ -7,11 +7,13 @@ import os
 /// The concrete TranscriptionService, wrapping SFSpeechRecognizer.
 ///
 /// On-device recognition is required whenever the locale supports it, so
-/// recording + transcription work fully offline. Because recognition tasks
-/// finalize after roughly a minute, the transcriber rotates to a fresh
-/// request whenever a final result arrives (and proactively ends audio once
-/// a partial result runs past ~50 seconds), carrying a `runningOffset` so
-/// utterance timestamps stay relative to the start of the whole recording.
+/// recording + transcription work fully offline. Because a single recognition
+/// task finalizes after roughly a minute, the transcriber rotates to a fresh
+/// request once a partial result runs past ~50 seconds. The rotation is
+/// seamless: the replacement request is swapped in atomically *before* the old
+/// one is ended, so no captured audio is dropped at the boundary, and each
+/// request carries the running offset of the real audio fed to earlier
+/// requests, so utterance timestamps stay relative to the whole recording.
 @MainActor
 @Observable
 final class SpeechTranscriber: TranscriptionService {
@@ -22,25 +24,40 @@ final class SpeechTranscriber: TranscriptionService {
     // MARK: - Private state (main actor)
 
     @ObservationIgnored private var recognizer: SFSpeechRecognizer?
+    /// The task for the current (live) request.
     @ObservationIgnored private var task: SFSpeechRecognitionTask?
-    /// Seconds of audio already finalized by earlier (rotated-out) requests.
-    @ObservationIgnored private var runningOffset: TimeInterval = 0
+    /// Tasks for requests that have been ended and are draining their final
+    /// result, keyed by generation. Cancelled on reset.
+    @ObservationIgnored private var drainTasks: [Int: SFSpeechRecognitionTask] = [:]
+    /// Where the next request's audio begins, in seconds from the start of the
+    /// whole recording. Advanced by the *measured* audio fed to each request.
+    @ObservationIgnored private var nextOffset: TimeInterval = 0
+    /// Start offset of each in-flight request (live or draining), keyed by
+    /// generation, so a late-arriving final folds in at the right place.
+    @ObservationIgnored private var requestOffsets: [Int: TimeInterval] = [:]
     @ObservationIgnored private var finalizedUtterances: [Utterance] = []
     /// Segments of the latest partial result, kept so a volatile tail can be
     /// given sensible timestamps if no final result arrives on finish().
     @ObservationIgnored private var volatileSegments: [SegmentData] = []
-    /// Bumped whenever a request is replaced or the session resets, so stale
-    /// recognition callbacks from older tasks are ignored.
+    /// Bumped whenever a request is created or the session resets; identifies
+    /// the live generation and tags recognition callbacks.
     @ObservationIgnored private var generation = 0
-    /// True after endAudio() was sent to force an early rotation.
+    /// True after the live request has been asked to rotate (endAudio), so the
+    /// proactive trigger fires only once per request.
     @ObservationIgnored private var rotationPending = false
     /// True while finish() is waiting for the last final result.
     @ObservationIgnored private var isFinishing = false
     @ObservationIgnored private var finishContinuation: CheckedContinuation<Void, Never>?
 
-    /// The live request, reachable from the audio capture thread. Guarded by
-    /// an unfair lock because `append(_:)` is nonisolated.
-    private let liveRequest = OSAllocatedUnfairLock<SFSpeechAudioBufferRecognitionRequest?>(uncheckedState: nil)
+    /// The live request plus the measured seconds of audio fed to it, reachable
+    /// from the audio capture thread. Guarded by an unfair lock because
+    /// `append(_:)` is nonisolated. Swapping the request and reading/resetting
+    /// the fed count happen under the same lock so rotation never loses audio.
+    private struct LiveState {
+        var request: SFSpeechAudioBufferRecognitionRequest?
+        var fedDuration: TimeInterval = 0
+    }
+    private let live = OSAllocatedUnfairLock<LiveState>(uncheckedState: LiveState())
 
     /// A new utterance group starts when the silence between segments
     /// exceeds this many seconds.
@@ -80,12 +97,15 @@ final class SpeechTranscriber: TranscriptionService {
         }
         resetSession()
         self.recognizer = recognizer
-        beginRequest()
+        beginRequest(startOffset: 0)
     }
 
     nonisolated func append(_ buffer: AVAudioPCMBuffer) {
-        liveRequest.withLockUnchecked { request in
-            request?.append(buffer)
+        let rate = buffer.format.sampleRate
+        let seconds = rate > 0 ? Double(buffer.frameLength) / rate : 0
+        live.withLockUnchecked { state in
+            state.request?.append(buffer)
+            state.fedDuration += seconds
         }
     }
 
@@ -98,9 +118,9 @@ final class SpeechTranscriber: TranscriptionService {
 
         isFinishing = true
         rotationPending = false
-        let request = liveRequest.withLockUnchecked { box -> SFSpeechAudioBufferRecognitionRequest? in
-            let current = box
-            box = nil
+        let request = live.withLockUnchecked { state -> SFSpeechAudioBufferRecognitionRequest? in
+            let current = state.request
+            state.request = nil
             return current
         }
         request?.endAudio()
@@ -116,21 +136,23 @@ final class SpeechTranscriber: TranscriptionService {
             }
         }
 
-        // No final result arrived in time: fold the volatile tail into a
-        // last utterance so nothing the user saw is lost.
+        // No final result arrived in time: fold the volatile tail into a last
+        // utterance so nothing the user saw is lost.
         let tail = snapshot.volatileText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !tail.isEmpty {
+            let offset = requestOffsets[generation] ?? nextOffset
             let utterance: Utterance
             if let first = volatileSegments.first, let last = volatileSegments.last {
                 utterance = Utterance(
                     text: tail,
-                    start: first.timestamp + runningOffset,
-                    end: last.timestamp + last.duration + runningOffset
+                    start: first.timestamp + offset,
+                    end: last.timestamp + last.duration + offset
                 )
             } else {
-                utterance = Utterance(text: tail, start: runningOffset, end: runningOffset)
+                utterance = Utterance(text: tail, start: offset, end: offset)
             }
             finalizedUtterances.append(utterance)
+            finalizedUtterances.sort { $0.start < $1.start }
             snapshot.finalized = finalizedUtterances
             snapshot.volatileText = ""
         }
@@ -146,23 +168,66 @@ final class SpeechTranscriber: TranscriptionService {
 
     // MARK: - Recognition lifecycle
 
-    /// Starts a fresh request + task; live transcription continues from
-    /// wherever the previous request left off (`runningOffset`).
-    private func beginRequest() {
-        guard let recognizer else { return }
-        generation += 1
-        let gen = generation
-        rotationPending = false
-
+    private func makeRequest() -> SFSpeechAudioBufferRecognitionRequest? {
+        guard let recognizer else { return nil }
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.addsPunctuation = true
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
         }
-        liveRequest.withLockUnchecked { $0 = request }
+        return request
+    }
 
+    /// Starts a fresh live request + task beginning at `startOffset`. Used for
+    /// the first request and for the fallback (natural-final) rotation, where
+    /// there is no overlapping request to drain.
+    private func beginRequest(startOffset: TimeInterval) {
+        guard let recognizer, let request = makeRequest() else { return }
+        generation += 1
+        let gen = generation
+        requestOffsets[gen] = startOffset
+        rotationPending = false
+        live.withLockUnchecked { state in
+            state.request = request
+            state.fedDuration = 0
+        }
         task = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            self?.handleRecognition(generation: gen, result: result, error: error)
+        }
+    }
+
+    /// Proactive, seamless rotation: publish a replacement request atomically
+    /// in place of the live one (so `append(_:)` never feeds a nil request and
+    /// no audio is dropped), advance the offset by the audio the old request
+    /// actually consumed, then end the old request so it drains its final.
+    private func rotate() {
+        guard let recognizer, let newRequest = makeRequest() else { return }
+        let oldGen = generation
+        let oldTask = task
+
+        generation += 1
+        let gen = generation
+
+        // Atomic swap: read what the old request consumed and install the new
+        // request in one lock acquisition.
+        let consumed = live.withLockUnchecked { state -> TimeInterval in
+            let fed = state.fedDuration
+            let old = state.request
+            state.request = newRequest
+            state.fedDuration = 0
+            // End the old request inside the lock so no further buffers reach
+            // it after the swap point.
+            old?.endAudio()
+            return fed
+        }
+
+        nextOffset += consumed
+        requestOffsets[gen] = nextOffset
+        rotationPending = false
+
+        if let oldTask { drainTasks[oldGen] = oldTask }
+        task = recognizer.recognitionTask(with: newRequest) { [weak self] result, error in
             self?.handleRecognition(generation: gen, result: result, error: error)
         }
     }
@@ -192,56 +257,84 @@ final class SpeechTranscriber: TranscriptionService {
         segments: [SegmentData],
         failed: Bool
     ) {
-        guard gen == generation else { return }
+        let isCurrent = (gen == generation)
+        // Accept callbacks for the live request or any still-draining request;
+        // ignore truly stale ones (e.g. after reset).
+        guard isCurrent || requestOffsets[gen] != nil else { return }
 
         if isFinal {
-            // Fold the finalized stretch in, advance the offset by this
-            // result's audio extent, and rotate to a fresh request.
-            let newUtterances = utterances(from: segments, offset: runningOffset)
-            finalizedUtterances.append(contentsOf: newUtterances)
-            if let last = segments.last {
-                runningOffset += last.timestamp + last.duration
-            }
-            volatileSegments = []
+            // Fold this request's finalized stretch in at its own start offset,
+            // then retire it. A draining request keeps the live one untouched.
+            let offset = requestOffsets[gen] ?? nextOffset
+            finalizedUtterances.append(contentsOf: utterances(from: segments, offset: offset))
+            finalizedUtterances.sort { $0.start < $1.start }
+            requestOffsets[gen] = nil
+            drainTasks[gen] = nil
             snapshot.finalized = finalizedUtterances
-            snapshot.volatileText = ""
-            if isFinishing {
-                resolveFinish()
-            } else {
-                beginRequest()
+
+            if isCurrent {
+                volatileSegments = []
+                snapshot.volatileText = ""
+                if isFinishing {
+                    resolveFinish()
+                } else {
+                    // The live request finalized on its own (no proactive
+                    // rotation happened in time); continue from the measured end.
+                    let consumed = live.withLockUnchecked { state -> TimeInterval in
+                        let fed = state.fedDuration
+                        state.request = nil
+                        return fed
+                    }
+                    nextOffset += consumed
+                    beginRequest(startOffset: nextOffset)
+                }
             }
             return
         }
 
         if failed {
-            // Keep everything already finalized; recording continues
-            // independently of transcription.
-            volatileSegments = []
-            snapshot.volatileText = ""
-            if isFinishing {
-                resolveFinish()
-            } else if rotationPending, recognizer != nil {
-                // The rotation we asked for ended in an error instead of a
-                // final result; start fresh so transcription keeps going.
-                beginRequest()
+            if isCurrent {
+                // Keep everything already finalized; recording continues
+                // independently of transcription.
+                requestOffsets[gen] = nil
+                volatileSegments = []
+                snapshot.volatileText = ""
+                if isFinishing {
+                    resolveFinish()
+                } else if rotationPending, recognizer != nil {
+                    // The rotation we asked for errored instead of finalizing;
+                    // start fresh so transcription keeps going.
+                    let consumed = live.withLockUnchecked { state -> TimeInterval in
+                        let fed = state.fedDuration
+                        state.request = nil
+                        return fed
+                    }
+                    nextOffset += consumed
+                    beginRequest(startOffset: nextOffset)
+                } else {
+                    task = nil
+                    live.withLockUnchecked { $0.request = nil }
+                }
             } else {
-                task = nil
-                liveRequest.withLockUnchecked { $0 = nil }
+                // A draining request errored before delivering its final;
+                // just retire it.
+                requestOffsets[gen] = nil
+                drainTasks[gen] = nil
             }
             return
         }
 
-        // Partial result: update the in-flight tail.
+        // Partial result: only the live request drives the volatile tail.
+        guard isCurrent else { return }
         volatileSegments = segments
         snapshot.volatileText = formattedText
 
-        // Rotate proactively before the recognizer's ~1 minute limit; the
-        // final result it produces triggers the actual swap above.
+        // Rotate proactively before the recognizer's ~1 minute limit. Segment
+        // timestamps are relative to this request's own audio.
         if !rotationPending, !isFinishing,
            let last = segments.last, last.timestamp > Self.rotationThreshold {
             rotationPending = true
-            let request = liveRequest.withLockUnchecked { $0 }
-            request?.endAudio()
+            rotate()
         }
     }
 
@@ -254,9 +347,12 @@ final class SpeechTranscriber: TranscriptionService {
         generation += 1
         task?.cancel()
         task = nil
+        for drained in drainTasks.values { drained.cancel() }
+        drainTasks = [:]
         recognizer = nil
-        liveRequest.withLockUnchecked { $0 = nil }
-        runningOffset = 0
+        live.withLockUnchecked { $0 = LiveState() }
+        nextOffset = 0
+        requestOffsets = [:]
         finalizedUtterances = []
         volatileSegments = []
         rotationPending = false

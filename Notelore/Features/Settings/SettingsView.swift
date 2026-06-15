@@ -67,9 +67,10 @@ struct SettingsView: View {
 
                 switch model.keyValidation {
                 case .validating:
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(Color.inkMuted)
+                    Text("Checking…")
+                        .font(.nlLabel)
+                        .tracking(1.4)
+                        .foregroundStyle(Color.inkMuted)
                 case .accepted:
                     Text("Key accepted")
                         .font(.nlLabel)
@@ -99,7 +100,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Minutes, answers, and prep notes are written by Google's Gemini service, using your own free key. Recordings and transcripts stay on this device, and are sent to Google only when you ask for one of those.")
                 Link(
-                    "Get a free key at Google AI Studio",
+                    "Get a free key from Google",
                     destination: URL(string: "https://aistudio.google.com/apikey")!
                 )
                 .foregroundStyle(Color.vermillion)
@@ -120,6 +121,8 @@ struct SettingsView: View {
                     Text(id).tag(id)
                 }
             }
+            .pickerStyle(.menu)
+            .tint(Color.ink)
             .font(.nlChrome)
             .foregroundStyle(Color.ink)
         } header: {
@@ -138,6 +141,8 @@ struct SettingsView: View {
                     Text(language.name).tag(language.id)
                 }
             }
+            .pickerStyle(.menu)
+            .tint(Color.ink)
             .font(.nlChrome)
             .foregroundStyle(Color.ink)
         } header: {
