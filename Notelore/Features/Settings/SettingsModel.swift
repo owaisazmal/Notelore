@@ -115,10 +115,19 @@ final class SettingsModel {
             try await services.llm.validateKey(key)
             keyValidation = .accepted
         } catch {
-            let message = (error as? LLMError)?.errorDescription
-                ?? "The service had trouble answering. Try again shortly."
-            keyValidation = .failed(message)
+            keyValidation = .failed(Self.validationMessage(for: error))
         }
+    }
+
+    /// A calm failure line for the key check. For a server error we surface
+    /// Google's own reason (e.g. an unavailable model) — it carries no private
+    /// content here and helps the user fix the real problem.
+    static func validationMessage(for error: Error) -> String {
+        if case let LLMError.server(_, message) = error, !message.isEmpty {
+            return message
+        }
+        return (error as? LLMError)?.errorDescription
+            ?? "The service had trouble answering. Try again shortly."
     }
 
     func removeKey() {

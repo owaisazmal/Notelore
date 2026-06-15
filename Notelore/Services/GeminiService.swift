@@ -25,7 +25,27 @@ final class GeminiService: LLMService {
 
     func validateKey(_ key: String) async throws {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        let request = try Self.makeRequest(path: "/models", key: trimmed)
+        // Validate with the very request the features use — a generateContent
+        // call on the selected model — so a key that "validates" is guaranteed
+        // to work for Minutes, Ask, and Prep. Listing models can succeed for a
+        // key (or model) that still can't generate, which would mislead the
+        // user with a false "accepted".
+        let body = RequestBody(
+            systemInstruction: nil,
+            contents: [RequestContent(role: "user", parts: [RequestPart(text: "Hi")])],
+            generationConfig: GenerationConfig(maxOutputTokens: 1)
+        )
+        let encoded: Data
+        do {
+            encoded = try JSONEncoder().encode(body)
+        } catch {
+            throw LLMError.server(status: -1, message: "The request could not be encoded.")
+        }
+        let request = try Self.makeRequest(
+            path: "/models/\(settings.geminiModel):generateContent",
+            key: trimmed,
+            jsonBody: encoded
+        )
         _ = try await perform(request)
     }
 
@@ -395,7 +415,7 @@ final class GeminiService: LLMService {
     // MARK: - Wire types
 
     private nonisolated struct RequestBody: Encodable {
-        var systemInstruction: RequestContent
+        var systemInstruction: RequestContent?
         var contents: [RequestContent]
         var generationConfig: GenerationConfig?
     }
@@ -415,8 +435,15 @@ final class GeminiService: LLMService {
     }
 
     private nonisolated struct GenerationConfig: Encodable {
-        var responseMimeType: String
-        var responseSchema: Schema
+        var responseMimeType: String?
+        var responseSchema: Schema?
+        var maxOutputTokens: Int?
+
+        init(responseMimeType: String? = nil, responseSchema: Schema? = nil, maxOutputTokens: Int? = nil) {
+            self.responseMimeType = responseMimeType
+            self.responseSchema = responseSchema
+            self.maxOutputTokens = maxOutputTokens
+        }
     }
 
     /// A node of Gemini's OpenAPI-subset response schema. A class so it can
