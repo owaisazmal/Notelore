@@ -135,7 +135,20 @@ final class AudioEngineRecorder: AudioRecordingService {
         }
 
         let inputNode = engine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
+        var inputFormat = inputNode.outputFormat(forBus: 0)
+        // The simulator (and, briefly, a device just after the session goes
+        // active) can report a 0 Hz / 0-channel input. Preparing the engine
+        // forces the hardware format to resolve; if it's still invalid, fail
+        // gracefully — feeding an invalid format to AVAudioFile / installTap
+        // throws an uncaught AVFAudio exception that crashes the whole app.
+        if inputFormat.sampleRate <= 0 || inputFormat.channelCount == 0 {
+            engine.prepare()
+            inputFormat = inputNode.outputFormat(forBus: 0)
+        }
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+            throw RecordingError.engineStartFailed("The microphone reported no usable audio input.")
+        }
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: inputFormat.sampleRate,

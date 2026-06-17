@@ -294,16 +294,23 @@ final class SpeechTranscriber: TranscriptionService {
 
         if failed {
             if isCurrent {
-                // Keep everything already finalized; recording continues
-                // independently of transcription.
+                // An error here is usually a silence/pause timeout from
+                // on-device recognition — it must NOT drop the line already
+                // spoken. Fold the in-flight volatile in first, then keep
+                // transcribing with a fresh request so later speech is still
+                // captured (never stop mid-recording).
+                let offset = requestOffsets[gen] ?? nextOffset
+                if !volatileSegments.isEmpty {
+                    finalizedUtterances.append(contentsOf: utterances(from: volatileSegments, offset: offset))
+                    finalizedUtterances.sort { $0.start < $1.start }
+                    snapshot.finalized = finalizedUtterances
+                }
                 requestOffsets[gen] = nil
                 volatileSegments = []
                 snapshot.volatileText = ""
                 if isFinishing {
                     resolveFinish()
-                } else if rotationPending, recognizer != nil {
-                    // The rotation we asked for errored instead of finalizing;
-                    // start fresh so transcription keeps going.
+                } else {
                     let consumed = live.withLockUnchecked { state -> TimeInterval in
                         let fed = state.fedDuration
                         state.request = nil
@@ -311,9 +318,6 @@ final class SpeechTranscriber: TranscriptionService {
                     }
                     nextOffset += consumed
                     beginRequest(startOffset: nextOffset)
-                } else {
-                    task = nil
-                    live.withLockUnchecked { $0.request = nil }
                 }
             } else {
                 // A draining request errored before delivering its final;
@@ -326,6 +330,29 @@ final class SpeechTranscriber: TranscriptionService {
 
         // Partial result: only the live request drives the volatile tail.
         guard isCurrent else { return }
+
+        // On-device recognition can start a new utterance within the same
+        // request after a pause, restarting its segment timestamps and dropping
+        // the earlier words from later results. Detect that regression and fold
+        // the previous volatile in before it's overwritten, so nothing spoken
+        // before the pause is lost.
+        // A reset shows up as the transcript's extent going *backwards*: the
+        // newest result's last-segment time is well before the previous one's
+        // (a fresh utterance restarting near 0), rather than growing. The 0.2 s
+        // margin ignores the small revisions a cumulative result normally makes.
+        if let prevLast = volatileSegments.last,
+           let newLast = segments.last,
+           newLast.timestamp + 0.2 < prevLast.timestamp {
+            let offset = requestOffsets[gen] ?? nextOffset
+            finalizedUtterances.append(contentsOf: utterances(from: volatileSegments, offset: offset))
+            finalizedUtterances.sort { $0.start < $1.start }
+            snapshot.finalized = finalizedUtterances
+            // The new utterance's timestamps restart near 0; shift this
+            // request's offset forward so it lands after the folded text.
+            nextOffset = offset + prevLast.timestamp + prevLast.duration
+            requestOffsets[gen] = nextOffset
+        }
+
         volatileSegments = segments
         snapshot.volatileText = formattedText
 
