@@ -47,7 +47,33 @@ final class NotesStore {
 
     func deleteAllData() {
         try? context.delete(model: Session.self)
+        try? context.delete(model: PrepEntry.self)
         AudioStorage.deleteAll()
+        save()
+    }
+
+    // MARK: Prep history
+
+    @discardableResult
+    func savePrepEntry(brief: String, guide: PrepGuide) -> PrepEntry {
+        let entry = PrepEntry(brief: brief, guide: guide)
+        context.insert(entry)
+        save()
+        return entry
+    }
+
+    func allPrepEntries() -> [PrepEntry] {
+        let descriptor = FetchDescriptor<PrepEntry>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
+        return (try? context.fetch(descriptor)) ?? []
+    }
+
+    func delete(_ entry: PrepEntry) {
+        context.delete(entry)
+        save()
+    }
+
+    func renamePrepEntry(_ entry: PrepEntry, to title: String) {
+        entry.title = title
         save()
     }
 

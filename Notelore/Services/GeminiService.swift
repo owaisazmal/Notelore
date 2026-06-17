@@ -78,7 +78,8 @@ final class GeminiService: LLMService {
                 path: "/models/\(settings.geminiModel):streamGenerateContent",
                 query: "alt=sse",
                 key: key,
-                jsonBody: JSONEncoder().encode(body)
+                jsonBody: JSONEncoder().encode(body),
+                timeout: 120
             )
         } catch {
             return AsyncThrowingStream { $0.finish(throwing: Self.mapTransportError(error)) }
@@ -139,12 +140,43 @@ final class GeminiService: LLMService {
         } catch {
             throw LLMError.server(status: -1, message: "The request could not be encoded.")
         }
+        // A generous timeout: the first call after launch can be slow while
+        // the model warms up, and these structured generations run longer than
+        // a key check.
         let request = try Self.makeRequest(
             path: "/models/\(settings.geminiModel):generateContent",
             key: key,
-            jsonBody: encoded
+            jsonBody: encoded,
+            timeout: 120
         )
-        return try await perform(request)
+        return try await performWithRetry(request)
+    }
+
+    /// Runs a request, transparently retrying once on a transient failure (a
+    /// timeout or a 5xx) — this is what made the *first* Prep/Minutes call of a
+    /// session fail and the next one succeed. Deterministic errors (invalid
+    /// key, bad response) are surfaced immediately, not retried.
+    private func performWithRetry(_ request: URLRequest, attempts: Int = 2) async throws -> Data {
+        var lastError: LLMError = .server(status: -1, message: "")
+        for attempt in 0..<attempts {
+            do {
+                return try await perform(request)
+            } catch let error as LLMError {
+                lastError = error
+                guard attempt < attempts - 1, Self.isRetryable(error) else { throw error }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+        throw lastError
+    }
+
+    /// Transient failures worth one automatic retry: connection/timeout
+    /// (status -1 from the transport) and server-side 5xx.
+    private nonisolated static func isRetryable(_ error: LLMError) -> Bool {
+        if case let .server(status, _) = error {
+            return status == -1 || status >= 500
+        }
+        return false
     }
 
     /// Runs a non-streaming request, mapping every failure to `LLMError`.
@@ -169,7 +201,8 @@ final class GeminiService: LLMService {
         path: String,
         query: String? = nil,
         key: String,
-        jsonBody: Data? = nil
+        jsonBody: Data? = nil,
+        timeout: TimeInterval = 60
     ) throws -> URLRequest {
         var urlString = baseURLString + path
         if let query { urlString += "?" + query }
@@ -177,7 +210,7 @@ final class GeminiService: LLMService {
             throw LLMError.server(status: -1, message: "The request URL could not be formed.")
         }
         var request = URLRequest(url: url)
-        request.timeoutInterval = 60
+        request.timeoutInterval = timeout
         request.httpMethod = jsonBody == nil ? "GET" : "POST"
         request.setValue(key, forHTTPHeaderField: "x-goog-api-key")
         if let jsonBody {

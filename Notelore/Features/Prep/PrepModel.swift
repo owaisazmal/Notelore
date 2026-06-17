@@ -17,12 +17,18 @@ final class PrepModel {
     var brief: String = ""
     private(set) var phase: Phase = .idle
     private(set) var error: LLMError?
+    /// Earlier preparations, newest first.
+    private(set) var history: [PrepEntry] = []
 
     private let services: AppServices
     private var generation: Task<Void, Never>?
 
     init(services: AppServices) {
         self.services = services
+    }
+
+    func loadHistory() {
+        history = services.notesStore.allPrepEntries()
     }
 
     var trimmedBrief: String {
@@ -38,8 +44,9 @@ final class PrepModel {
         return nil
     }
 
-    /// The epigraph shows before anything has been drafted.
-    var showsEmptyState: Bool { phase == .idle && error == nil }
+    /// The epigraph shows only on a clean, empty start — no result, no error,
+    /// nothing prepared before.
+    var showsEmptyState: Bool { phase == .idle && error == nil && history.isEmpty }
 
     func prepare() {
         guard canPrepare else { return }
@@ -56,6 +63,8 @@ final class PrepModel {
             do {
                 let guide = try await self.services.llm.prepGuide(from: brief)
                 guard !Task.isCancelled else { return }
+                self.services.notesStore.savePrepEntry(brief: brief, guide: guide)
+                self.loadHistory()
                 self.phase = .finished(guide)
             } catch let llmError as LLMError {
                 guard !Task.isCancelled else { return }
@@ -77,6 +86,39 @@ final class PrepModel {
         brief = ""
         error = nil
         phase = .idle
+        loadHistory()
+    }
+
+    /// Reopen a saved preparation for rereading.
+    func show(_ entry: PrepEntry) {
+        generation?.cancel()
+        generation = nil
+        error = nil
+        brief = entry.brief
+        phase = .finished(entry.guide)
+    }
+
+    func delete(_ entry: PrepEntry) {
+        services.notesStore.delete(entry)
+        loadHistory()
+    }
+
+    /// Rename a saved preparation; an empty name keeps the existing title.
+    func rename(_ entry: PrepEntry, to title: String) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        services.notesStore.renamePrepEntry(entry, to: trimmed)
+        loadHistory()
+    }
+
+    /// Leave a finished guide and return to the composer, keeping the brief
+    /// and history intact.
+    func back() {
+        generation?.cancel()
+        generation = nil
+        error = nil
+        phase = .idle
+        loadHistory()
     }
 
     /// A Markdown rendering of the guide for export via ShareLink.

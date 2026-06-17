@@ -5,6 +5,8 @@ import SwiftUI
 /// happens during a conversation.
 struct PrepView: View {
     @State private var model: PrepModel
+    @State private var entryBeingRenamed: PrepEntry?
+    @State private var renameText = ""
 
     init(services: AppServices) {
         _model = State(initialValue: PrepModel(services: services))
@@ -27,14 +29,39 @@ struct PrepView: View {
             .scrollDismissesKeyboard(.interactively)
             .paperPage()
             .navigationTitle("Prep")
+            .navigationBarTitleDisplayMode(model.guide == nil ? .large : .inline)
+            .onAppear { model.loadHistory() }
             .toolbar {
                 if let guide = model.guide {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            model.back()
+                        } label: {
+                            Label("Prep", systemImage: "chevron.left")
+                        }
+                        .tint(Color.vermillion)
+                    }
                     ToolbarItem(placement: .topBarTrailing) {
                         ShareLink(item: PrepModel.markdown(for: guide, brief: model.brief))
                     }
                 }
             }
+            .alert("Rename", isPresented: renamePresented, presenting: entryBeingRenamed) { entry in
+                TextField("Title", text: $renameText)
+                Button("Save") {
+                    model.rename(entry, to: renameText)
+                    entryBeingRenamed = nil
+                }
+                Button("Cancel", role: .cancel) { entryBeingRenamed = nil }
+            }
         }
+    }
+
+    private var renamePresented: Binding<Bool> {
+        Binding(
+            get: { entryBeingRenamed != nil },
+            set: { if !$0 { entryBeingRenamed = nil } }
+        )
     }
 
     // MARK: - Compose
@@ -72,6 +99,65 @@ struct PrepView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.top, 48)
             }
+
+            if !model.history.isEmpty {
+                historySection
+                    .padding(.top, 12)
+            }
+        }
+    }
+
+    // MARK: - History
+
+    private var historySection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            SectionLabel("RECENTLY PREPARED")
+                .padding(.bottom, 4)
+            ForEach(model.history, id: \.id) { entry in
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Button {
+                        model.show(entry)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(entry.title)
+                                .font(.nlProseSmall)
+                                .foregroundStyle(Color.ink)
+                                .multilineTextAlignment(.leading)
+                            Text(entry.createdAt.formatted(date: .abbreviated, time: .shortened))
+                                .font(.nlTimestamp)
+                                .foregroundStyle(Color.inkMuted)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+
+                    Menu {
+                        Button {
+                            renameText = entry.title
+                            entryBeingRenamed = entry
+                        } label: {
+                            Label("Rename", systemImage: "pencil")
+                        }
+                        Button(role: .destructive) {
+                            model.delete(entry)
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.nlChromeSmall)
+                            .foregroundStyle(Color.inkMuted)
+                            .frame(width: 32, height: 32, alignment: .trailing)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("More actions for this preparation")
+                }
+                .padding(.vertical, 12)
+
+                if entry.id != model.history.last?.id {
+                    InkDivider()
+                }
+            }
         }
     }
 
@@ -81,7 +167,7 @@ struct PrepView: View {
             .foregroundStyle(Color.ink)
             .scrollContentBackground(.hidden)
             .padding(8)
-            .frame(minHeight: 160)
+            .frame(height: 200)
             .background(Color.paperRaised)
             .clipShape(RoundedRectangle(cornerRadius: Theme.cornerRadius))
             .overlay(

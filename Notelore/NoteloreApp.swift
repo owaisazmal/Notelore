@@ -8,7 +8,7 @@ struct NoteloreApp: App {
 
     init() {
         do {
-            let container = try ModelContainer(for: Session.self, Note.self)
+            let container = try ModelContainer(for: Session.self, Note.self, PrepEntry.self)
             self.container = container
             self._services = State(initialValue: AppServices(modelContainer: container))
         } catch {
