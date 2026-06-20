@@ -355,33 +355,55 @@ private struct MinutesView: View {
 
     // MARK: Unwritten
 
+    @ViewBuilder
     private var unwritten: some View {
-        VStack(spacing: Theme.pageMargin) {
-            EpigraphView(text: "The minutes for this sitting are not yet written.")
-                .frame(maxWidth: .infinity)
+        if model.isProcessing {
+            processing
+        } else {
+            VStack(spacing: Theme.pageMargin) {
+                EpigraphView(text: "The minutes for this sitting are not yet written.")
+                    .frame(maxWidth: .infinity)
 
-            if model.isWriting {
-                Text("Writing minutes…")
-                    .font(.nlProseItalic)
-                    .foregroundStyle(Color.inkMuted)
-            } else {
-                Button("Write minutes") {
-                    Task { await model.writeMinutes() }
+                if model.isWriting {
+                    Text("Writing minutes…")
+                        .font(.nlProseItalic)
+                        .foregroundStyle(Color.inkMuted)
+                } else {
+                    Button("Write minutes") {
+                        Task { await model.writeMinutes() }
+                    }
+                    .buttonStyle(NLPrimaryButtonStyle())
+                    .disabled(!model.hasKey)
+                    .opacity(model.hasKey ? 1 : 0.5)
                 }
-                .buttonStyle(NLPrimaryButtonStyle())
-                .disabled(!model.hasKey)
-                .opacity(model.hasKey ? 1 : 0.5)
-            }
 
-            if let errorText = model.errorText {
-                Text(errorText)
-                    .font(.nlChromeSmall)
-                    .foregroundStyle(Color.inkMuted)
-                    .multilineTextAlignment(.center)
+                if let errorText = model.errorText {
+                    Text(errorText)
+                        .font(.nlChromeSmall)
+                        .foregroundStyle(Color.inkMuted)
+                        .multilineTextAlignment(.center)
+                }
             }
+            .frame(maxWidth: .infinity)
+            .padding(.top, 24)
+        }
+    }
+
+    /// Shown while the minutes are still being written in the background; the
+    /// transcript is already available on the other tab.
+    private var processing: some View {
+        VStack(spacing: 12) {
+            EpigraphView(text: "The minutes are still being written…")
+                .frame(maxWidth: .infinity)
+            Text("This can take a moment for a long recording. The transcript is ready now.")
+                .font(.nlChromeSmall)
+                .foregroundStyle(Color.inkMuted)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 24)
+        .animation(Theme.fade, value: model.isProcessing)
     }
 
     // MARK: Building blocks

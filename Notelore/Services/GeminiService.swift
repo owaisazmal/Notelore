@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// The concrete `LLMService` speaking to the Gemini REST API with the
 /// user's own key (bring-your-own-key, BYOK).
@@ -9,7 +10,15 @@ import Foundation
 @MainActor
 final class GeminiService: LLMService {
 
+    /// Diagnostics only — request shape and failures. The API key and the
+    /// transcript text are never logged; only sizes, models, and Google's own
+    /// short error text reach the log.
+    private nonisolated static let log = Logger(subsystem: "com.owaiskhan.notelore", category: "gemini")
+
     private nonisolated static let baseURLString = "https://generativelanguage.googleapis.com/v1beta"
+    /// A fast model for the live margin-notes overlay, independent of the
+    /// minutes-quality model chosen in Settings — latency matters most here.
+    private nonisolated static let liveModel = "gemini-2.5-flash-lite"
 
     private let keychain: KeychainStore
     private let settings: AppSettings
@@ -88,18 +97,30 @@ final class GeminiService: LLMService {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let (bytes, response) = try await session.bytes(for: request)
-                    let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-                    if status != 200 {
+                    for attempt in 0..<2 {
+                        let (bytes, response) = try await session.bytes(for: request)
+                        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                        if status == 200 {
+                            for try await line in bytes.lines {
+                                if Task.isCancelled { break }
+                                if let chunk = Self.textChunk(fromSSELine: line) {
+                                    continuation.yield(chunk)
+                                }
+                            }
+                            continuation.finish()
+                            return
+                        }
                         var body = Data()
                         for try await byte in bytes { body.append(byte) }
-                        throw Self.mapHTTPError(status: status, data: body)
-                    }
-                    for try await line in bytes.lines {
-                        if Task.isCancelled { break }
-                        if let chunk = Self.textChunk(fromSSELine: line) {
-                            continuation.yield(chunk)
+                        let mapped = Self.mapHTTPError(status: status, data: body)
+                        // Absorb one brief rate limit before answering; surface
+                        // longer waits and every other failure.
+                        if attempt == 0, case let .rateLimited(retry) = mapped,
+                           TimeInterval(retry ?? 3) <= 12 {
+                            try await Task.sleep(for: .seconds(TimeInterval(retry ?? 3)))
+                            continue
                         }
+                        throw mapped
                     }
                     continuation.finish()
                 } catch is CancellationError {
@@ -121,10 +142,33 @@ final class GeminiService: LLMService {
         return try Self.parsePrepGuide(from: data)
     }
 
+    func marginNotes(forTranscript transcript: String, covered: [String]) async throws -> [MarginNote] {
+        let coveredList = covered.isEmpty ? "(none)" : covered.joined(separator: ", ")
+        let userText = "Already noted: \(coveredList)\n\nRecent passage:\n\(transcript)"
+        // Live overlay: a fast model, a short timeout, and no retry — a missed
+        // cycle just refreshes on the next one rather than stalling.
+        let data = try await generate(
+            systemInstruction: Self.marginNotesInstruction,
+            userText: userText,
+            schema: Self.marginNotesSchema,
+            model: Self.liveModel,
+            timeout: 15,
+            retry: false
+        )
+        return try Self.parseMarginNotes(from: data)
+    }
+
     // MARK: - Requests
 
     /// JSON-mode `generateContent` call shared by `distill` and `prepGuide`.
-    private func generate(systemInstruction: String, userText: String, schema: Schema) async throws -> Data {
+    private func generate(
+        systemInstruction: String,
+        userText: String,
+        schema: Schema,
+        model: String? = nil,
+        timeout: TimeInterval = 120,
+        retry: Bool = true
+    ) async throws -> Data {
         guard let key = keychain.apiKey(for: .gemini) else { throw LLMError.missingKey }
         let body = RequestBody(
             systemInstruction: RequestContent(parts: [RequestPart(text: systemInstruction)]),
@@ -140,31 +184,62 @@ final class GeminiService: LLMService {
         } catch {
             throw LLMError.server(status: -1, message: "The request could not be encoded.")
         }
-        // A generous timeout: the first call after launch can be slow while
-        // the model warms up, and these structured generations run longer than
-        // a key check.
+        // The default 120 s timeout suits Minutes/Prep, where the first call
+        // can be slow while the model warms up; the live overlay overrides it.
         let request = try Self.makeRequest(
-            path: "/models/\(settings.geminiModel):generateContent",
+            path: "/models/\(model ?? settings.geminiModel):generateContent",
             key: key,
             jsonBody: encoded,
-            timeout: 120
+            timeout: timeout
         )
-        return try await performWithRetry(request)
+        // Log the request shape for the user-triggered calls (Minutes/Prep);
+        // the live overlay passes an explicit `model` and stays quiet to avoid
+        // spamming the log every few seconds.
+        let chosenModel = model ?? settings.geminiModel
+        if model == nil {
+            Self.log.notice("generate: model \(chosenModel, privacy: .public), input \(userText.count) chars")
+        }
+        let data = retry ? try await performWithRetry(request) : try await perform(request)
+        if let reason = Self.finishReason(in: data), reason != "STOP" {
+            // MAX_TOKENS, SAFETY, RECITATION, etc. — the body may be truncated
+            // or empty, which then shows up as an unreadable reply downstream.
+            Self.log.error("generate: model \(chosenModel, privacy: .public) finished abnormally: \(reason, privacy: .public)")
+        }
+        return data
     }
 
     /// Runs a request, transparently retrying once on a transient failure (a
     /// timeout or a 5xx) — this is what made the *first* Prep/Minutes call of a
     /// session fail and the next one succeed. Deterministic errors (invalid
     /// key, bad response) are surfaced immediately, not retried.
-    private func performWithRetry(_ request: URLRequest, attempts: Int = 2) async throws -> Data {
+    private func performWithRetry(_ request: URLRequest, attempts: Int = 3) async throws -> Data {
         var lastError: LLMError = .server(status: -1, message: "")
         for attempt in 0..<attempts {
             do {
                 return try await perform(request)
             } catch let error as LLMError {
                 lastError = error
-                guard attempt < attempts - 1, Self.isRetryable(error) else { throw error }
-                try? await Task.sleep(for: .seconds(1))
+                guard attempt < attempts - 1 else { throw error }
+                if case let .rateLimited(retry) = error {
+                    // Absorb a *brief* rate limit by waiting the suggested delay
+                    // and trying again; surface longer ones to the user.
+                    let wait = TimeInterval(retry ?? 3)
+                    guard wait <= 12 else { throw error }
+                    try? await Task.sleep(for: .seconds(wait))
+                } else if case let .server(status, _) = error, status >= 500 {
+                    // Transient overload (503) or server error: these come back
+                    // fast, so ride them out with a short escalating back-off
+                    // (1 s, then 2 s) rather than making the user retry by hand.
+                    Self.log.notice("retrying after HTTP \(status, privacy: .public) (attempt \(attempt + 1, privacy: .public))")
+                    try? await Task.sleep(for: .seconds(TimeInterval(1 << attempt)))
+                } else if Self.isRetryable(error) {
+                    // Timeout / dropped connection: each attempt is slow, so try
+                    // just once more before surfacing it.
+                    guard attempt == 0 else { throw error }
+                    try? await Task.sleep(for: .seconds(1))
+                } else {
+                    throw error
+                }
             }
         }
         throw lastError
@@ -186,10 +261,17 @@ final class GeminiService: LLMService {
         do {
             (data, response) = try await session.data(for: request)
         } catch {
+            // Timeout / lost connection / offline — the transport never reached
+            // a status code. Surfaced as `.server(status: -1, …)` or `.offline`.
+            Self.log.error("request transport failure: \(error.localizedDescription, privacy: .public)")
             throw Self.mapTransportError(error)
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard status == 200 else {
+            // The single most useful line for diagnosing "trouble answering":
+            // the real HTTP status and Google's own error text (never the key).
+            let message = Self.shortErrorMessage(in: data)
+            Self.log.error("request failed: HTTP \(status, privacy: .public) — \(message.isEmpty ? "(no message)" : message, privacy: .public)")
             throw Self.mapHTTPError(status: status, data: data)
         }
         return data
@@ -254,6 +336,29 @@ final class GeminiService: LLMService {
         never invent facts the brief does not support.
         """
 
+    private nonisolated static let marginNotesInstruction = """
+        You annotate the transcript of a live conversation or talk with short \
+        "margin notes" that help the reader follow and remember it.
+        Produce two kinds of notes:
+        1. Definitions — for meaningful, technical, or potentially unfamiliar \
+        terms, jargon, acronyms, names, places, or concepts that appear, give a \
+        one- or two-sentence plain definition. Put the term in "headword" and \
+        set isQuestion to false.
+        2. Answers — for a genuine question of fact or general knowledge raised \
+        in the discussion, give a brief, neutral answer or the relevant \
+        background in one or two sentences. Put the question in "headword" and \
+        set isQuestion to true.
+        Only include notes genuinely useful for understanding the content. Never \
+        repeat anything in the "already noted" list. Skip small talk, filler, \
+        and obvious everyday words.
+        You are a neutral reference in the margin: never tell anyone what to say, \
+        how to respond, what to do, how to negotiate, or how to handle the \
+        conversation; give no advice and take no side. Notes describe the \
+        content only.
+        Respond in the language of the transcript. If nothing new is worth \
+        noting, return an empty list.
+        """
+
     /// One user turn: each excerpt labeled with its session, then the question.
     nonisolated static func answerPrompt(question: String, excerpts: [SourceExcerpt]) -> String {
         var lines: [String] = []
@@ -310,6 +415,25 @@ final class GeminiService: LLMService {
         required: ["likelyQuestions", "talkingPoints"]
     )
 
+    private nonisolated static let marginNotesSchema = Schema(
+        type: "OBJECT",
+        properties: [
+            "notes": Schema(
+                type: "ARRAY",
+                items: Schema(
+                    type: "OBJECT",
+                    properties: [
+                        "headword": Schema(type: "STRING"),
+                        "note": Schema(type: "STRING"),
+                        "isQuestion": Schema(type: "BOOLEAN"),
+                    ],
+                    required: ["headword", "note", "isQuestion"]
+                )
+            ),
+        ],
+        required: ["notes"]
+    )
+
     // MARK: - Parsing (nonisolated; unit tests call these directly)
 
     /// Digs `candidates[0].content.parts[0].text` out of a `generateContent`
@@ -331,6 +455,22 @@ final class GeminiService: LLMService {
             return try JSONDecoder().decode(PrepGuide.self, from: payload)
         } catch {
             throw LLMError.unparseableResponse("The guide did not match the expected shape.")
+        }
+    }
+
+    nonisolated static func parseMarginNotes(from data: Data) throws -> [MarginNote] {
+        struct Wrapper: Decodable { var notes: [MarginNoteData] }
+        let payload = try innerJSONData(from: data)
+        do {
+            let wrapper = try JSONDecoder().decode(Wrapper.self, from: payload)
+            return wrapper.notes
+                .filter {
+                    !$0.headword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && !$0.note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+                .map { MarginNote(headword: $0.headword, note: $0.note, isQuestion: $0.isQuestion) }
+        } catch {
+            throw LLMError.unparseableResponse("The notes did not match the expected shape.")
         }
     }
 
@@ -431,6 +571,16 @@ final class GeminiService: LLMService {
         return ""
     }
 
+    /// The `finishReason` of the first candidate, if the response carried one.
+    /// "STOP" is the healthy case; "MAX_TOKENS"/"SAFETY"/"RECITATION" mean the
+    /// reply was cut short or withheld, which is worth logging.
+    private nonisolated static func finishReason(in data: Data) -> String? {
+        guard let envelope = try? JSONDecoder().decode(ResponseEnvelope.self, from: data) else {
+            return nil
+        }
+        return envelope.candidates?.first?.finishReason
+    }
+
     /// Maps transport-layer failures to `LLMError`; `LLMError` passes through.
     nonisolated static func mapTransportError(_ error: Error) -> LLMError {
         if let llmError = error as? LLMError { return llmError }
@@ -506,6 +656,7 @@ final class GeminiService: LLMService {
     private nonisolated struct ResponseEnvelope: Decodable {
         nonisolated struct Candidate: Decodable {
             var content: CandidateContent?
+            var finishReason: String?
         }
         nonisolated struct CandidateContent: Decodable {
             var parts: [CandidatePart]?

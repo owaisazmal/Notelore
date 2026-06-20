@@ -49,6 +49,41 @@ import Testing
     }
     """
 
+    // MARK: - parseMarginNotes
+
+    @Test func parseMarginNotes_decodesDefinitionsAndQuestions() throws {
+        let inner = """
+        {"notes":[
+          {"headword":"SLO","note":"A service level objective: a target for reliability.","isQuestion":false},
+          {"headword":"What's our error budget?","note":"The allowed unreliability before features must pause.","isQuestion":true}
+        ]}
+        """
+        let notes = try GeminiService.parseMarginNotes(from: envelope(innerText: inner))
+        #expect(notes.count == 2)
+        #expect(notes[0].headword == "SLO")
+        #expect(notes[0].isQuestion == false)
+        #expect(notes[1].isQuestion == true)
+        // Distinct ids are attached on parse.
+        #expect(Set(notes.map(\.id)).count == 2)
+    }
+
+    @Test func parseMarginNotes_emptyListIsAllowed() throws {
+        let notes = try GeminiService.parseMarginNotes(from: envelope(innerText: #"{"notes":[]}"#))
+        #expect(notes.isEmpty)
+    }
+
+    @Test func parseMarginNotes_dropsBlankEntries() throws {
+        let inner = #"{"notes":[{"headword":"  ","note":"x","isQuestion":false},{"headword":"Term","note":"   ","isQuestion":false},{"headword":"Good","note":"A kept note.","isQuestion":false}]}"#
+        let notes = try GeminiService.parseMarginNotes(from: envelope(innerText: inner))
+        #expect(notes.map(\.headword) == ["Good"])
+    }
+
+    @Test func parseMarginNotes_throwsOnBadShape() {
+        #expect(throws: (any Error).self) {
+            _ = try GeminiService.parseMarginNotes(from: envelope(innerText: #"{"notes":"nope"}"#))
+        }
+    }
+
     // MARK: - parseDistilledNote
 
     @Test func parseDistilledNote_decodesEveryField_andOwnerNilWhenAbsent() throws {

@@ -27,9 +27,16 @@ final class SessionDetailModel {
         services.keychain.apiKey(for: .gemini) != nil
     }
 
+    /// True while the minutes are being written in the background — started
+    /// automatically when a recording ends, so a long session can finish
+    /// processing after you've left the Record screen.
+    var isProcessing: Bool {
+        services.processing.isProcessing(session.id)
+    }
+
     /// Generates (or regenerates) the session's Minutes in place.
     func writeMinutes() async {
-        guard !isWriting else { return }
+        guard !isWriting, !isProcessing else { return }
         isWriting = true
         errorText = nil
         defer { isWriting = false }

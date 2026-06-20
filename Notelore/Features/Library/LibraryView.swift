@@ -60,7 +60,7 @@ struct LibraryView: View {
                 NavigationLink {
                     SessionDetailView(session: session, services: services)
                 } label: {
-                    SessionRow(session: session)
+                    SessionRow(session: session, isProcessing: services.processing.isProcessing(session.id))
                 }
                 .listRowBackground(Color.paper)
                 .listRowSeparatorTint(Color.inkHairline)
@@ -148,6 +148,7 @@ struct LibraryView: View {
 /// preview, and any tags.
 private struct SessionRow: View {
     let session: Session
+    var isProcessing = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -159,6 +160,13 @@ private struct SessionRow: View {
             Text(metaLine)
                 .font(.nlTimestamp)
                 .foregroundStyle(Color.inkMuted)
+
+            if isProcessing {
+                Text("WRITING MINUTES…")
+                    .font(.nlLabel)
+                    .tracking(1.4)
+                    .foregroundStyle(Color.inkMuted)
+            }
 
             if !preview.isEmpty {
                 Text(preview)

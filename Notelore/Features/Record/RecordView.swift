@@ -96,7 +96,17 @@ struct RecordView: View {
             InkDivider()
 
             if model.transcriptionActive {
-                transcriptScroll
+                if model.marginNotesAvailable {
+                    paneToggle
+                        .padding(.horizontal, Theme.pageMargin)
+                        .padding(.top, 12)
+                        .padding(.bottom, 2)
+                }
+                if model.showsMarginNotes {
+                    marginNotesScroll
+                } else {
+                    transcriptScroll
+                }
             } else {
                 VStack {
                     Spacer()
@@ -178,6 +188,90 @@ struct RecordView: View {
     }
 
     private var transcriptBottomID: String { "transcript-bottom" }
+
+    // MARK: Margin notes (live)
+
+    /// Flat paper toggle between the live transcript and the live margin notes.
+    private var paneToggle: some View {
+        HStack(spacing: 28) {
+            paneButton(title: "Transcript", selected: !model.showsMarginNotes) {
+                model.showsMarginNotes = false
+            }
+            paneButton(title: marginTitle, selected: model.showsMarginNotes) {
+                model.showsMarginNotes = true
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var marginTitle: String {
+        model.marginNotes.isEmpty ? "Live Definitions" : "Live Definitions (\(model.marginNotes.count))"
+    }
+
+    private func paneButton(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Text(title)
+                    .font(.nlLabel)
+                    .tracking(1.4)
+                    .foregroundStyle(selected ? Color.ink : Color.inkMuted)
+                Rectangle()
+                    .fill(selected ? Color.ink : Color.clear)
+                    .frame(height: Theme.hairline)
+            }
+            .fixedSize()
+        }
+        .buttonStyle(.plain)
+        .animation(Theme.fade, value: selected)
+    }
+
+    @ViewBuilder
+    private var marginNotesScroll: some View {
+        if model.marginNotes.isEmpty {
+            VStack {
+                Spacer()
+                Text("Defining what's being said…")
+                    .font(.nlProseItalic)
+                    .foregroundStyle(Color.inkMuted)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 36)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity)
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    ForEach(model.marginNotes) { note in
+                        marginNoteRow(note)
+                    }
+                }
+                .padding(.horizontal, Theme.pageMargin)
+                .padding(.vertical, 18)
+                .animation(Theme.fade, value: model.marginNotes.count)
+            }
+            .scrollContentBackground(.hidden)
+        }
+    }
+
+    private func marginNoteRow(_ note: MarginNote) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            if note.isQuestion {
+                Text("QUESTION")
+                    .font(.nlLabel)
+                    .tracking(1.4)
+                    .foregroundStyle(Color.inkMuted)
+            }
+            Text(note.headword)
+                .font(.nlHeading)
+                .foregroundStyle(Color.ink)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(note.note)
+                .font(.nlProse)
+                .foregroundStyle(Color.inkMuted)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
 
     // MARK: Saving
 

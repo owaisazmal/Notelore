@@ -18,6 +18,7 @@ struct SettingsView: View {
                 keySection
                 minutesSection
                 transcriptionSection
+                marginNotesSection
                 dataSection
                 colophon
             }
@@ -149,6 +150,27 @@ struct SettingsView: View {
             SectionLabel("Transcription")
         } footer: {
             Text("Transcription happens on this device when the language allows. On-device support varies by language.")
+                .font(.nlChromeSmall)
+                .foregroundStyle(Color.inkMuted)
+        }
+        .listRowBackground(Color.paperRaised)
+        .listRowSeparatorTint(Color.inkHairline)
+    }
+
+    // MARK: Margin notes
+
+    private var marginNotesSection: some View {
+        Section {
+            Toggle(isOn: $settings.liveMarginNotesEnabled) {
+                Text("Live Definitions")
+                    .font(.nlChrome)
+                    .foregroundStyle(Color.ink)
+            }
+            .tint(Color.sage)
+        } header: {
+            SectionLabel("Live Definitions")
+        } footer: {
+            Text("While recording, define the terms being spoken and answer questions raised, in the margin. This calls the service repeatedly while you watch it, so it uses your key's quota — leave it off to keep that for minutes and answers.")
                 .font(.nlChromeSmall)
                 .foregroundStyle(Color.inkMuted)
         }

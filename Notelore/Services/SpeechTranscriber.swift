@@ -7,13 +7,17 @@ import os
 /// The concrete TranscriptionService, wrapping SFSpeechRecognizer.
 ///
 /// On-device recognition is required whenever the locale supports it, so
-/// recording + transcription work fully offline. Because a single recognition
-/// task finalizes after roughly a minute, the transcriber rotates to a fresh
-/// request once a partial result runs past ~50 seconds. The rotation is
-/// seamless: the replacement request is swapped in atomically *before* the old
-/// one is ended, so no captured audio is dropped at the boundary, and each
-/// request carries the running offset of the real audio fed to earlier
-/// requests, so utterance timestamps stay relative to the whole recording.
+/// recording + transcription work fully offline. A single recognition task
+/// finalizes after roughly a minute, so the transcriber ends the current
+/// request a little before that and starts a fresh one, carrying a running
+/// offset so utterance timestamps stay relative to the whole recording.
+///
+/// The recognizer's partial results are NOT reliably cumulative — for long
+/// audio it drops earlier words from the window, and after a pause it can
+/// restart segment timestamps for a new sentence. So instead of trusting the
+/// latest partial, this accumulates every segment it sees (merging the moving
+/// window and re-basing after a reset) into the request's full passage, which
+/// is what gets committed. That's what keeps earlier sentences from being lost.
 @MainActor
 @Observable
 final class SpeechTranscriber: TranscriptionService {
@@ -21,38 +25,40 @@ final class SpeechTranscriber: TranscriptionService {
     /// Live snapshot for the UI, updated on the main actor.
     private(set) var snapshot = TranscriptSnapshot()
 
+    static let log = Logger(subsystem: "com.owaiskhan.notelore", category: "transcriber")
+
     // MARK: - Private state (main actor)
 
     @ObservationIgnored private var recognizer: SFSpeechRecognizer?
-    /// The task for the current (live) request.
     @ObservationIgnored private var task: SFSpeechRecognitionTask?
-    /// Tasks for requests that have been ended and are draining their final
-    /// result, keyed by generation. Cancelled on reset.
-    @ObservationIgnored private var drainTasks: [Int: SFSpeechRecognitionTask] = [:]
-    /// Where the next request's audio begins, in seconds from the start of the
-    /// whole recording. Advanced by the *measured* audio fed to each request.
-    @ObservationIgnored private var nextOffset: TimeInterval = 0
-    /// Start offset of each in-flight request (live or draining), keyed by
-    /// generation, so a late-arriving final folds in at the right place.
-    @ObservationIgnored private var requestOffsets: [Int: TimeInterval] = [:]
-    @ObservationIgnored private var finalizedUtterances: [Utterance] = []
-    /// Segments of the latest partial result, kept so a volatile tail can be
-    /// given sensible timestamps if no final result arrives on finish().
-    @ObservationIgnored private var volatileSegments: [SegmentData] = []
-    /// Bumped whenever a request is created or the session resets; identifies
-    /// the live generation and tags recognition callbacks.
+    /// Utterances committed by earlier (already-ended) requests.
+    @ObservationIgnored private var committed: [Utterance] = []
+    /// Where the current request's audio begins, in seconds from the start of
+    /// the whole recording. Advanced by the measured audio fed to each request.
+    @ObservationIgnored private var baseOffset: TimeInterval = 0
+
+    // Accumulated segments for the *current* request, robust to the recognizer
+    // dropping old words and restarting timestamps after a pause:
+    /// Completed chunks of the current request (sentences the recognizer reset
+    /// past), re-based onto one monotonic timeline.
+    @ObservationIgnored private var stableSegments: [SegmentData] = []
+    /// Re-base offset for the in-progress chunk (advances each time the
+    /// recognizer restarts its timeline after a pause).
+    @ObservationIgnored private var chunkOffset: TimeInterval = 0
+    /// The latest partial's segments for the in-progress chunk.
+    @ObservationIgnored private var livePartial: [SegmentData] = []
+
+    /// Identifies the live request; stale callbacks from earlier ones ignored.
     @ObservationIgnored private var generation = 0
-    /// True after the live request has been asked to rotate (endAudio), so the
-    /// proactive trigger fires only once per request.
-    @ObservationIgnored private var rotationPending = false
-    /// True while finish() is waiting for the last final result.
+    /// True once the live request has been asked to end early (rotate).
+    @ObservationIgnored private var rotateRequested = false
+    /// True while finish() is awaiting the last final result.
     @ObservationIgnored private var isFinishing = false
     @ObservationIgnored private var finishContinuation: CheckedContinuation<Void, Never>?
 
     /// The live request plus the measured seconds of audio fed to it, reachable
     /// from the audio capture thread. Guarded by an unfair lock because
-    /// `append(_:)` is nonisolated. Swapping the request and reading/resetting
-    /// the fed count happen under the same lock so rotation never loses audio.
+    /// `append(_:)` is nonisolated.
     private struct LiveState {
         var request: SFSpeechAudioBufferRecognitionRequest?
         var fedDuration: TimeInterval = 0
@@ -62,8 +68,12 @@ final class SpeechTranscriber: TranscriptionService {
     /// A new utterance group starts when the silence between segments
     /// exceeds this many seconds.
     private static let utteranceGap: TimeInterval = 0.8
-    /// Rotate proactively once a partial result runs past this many seconds.
-    private static let rotationThreshold: TimeInterval = 50
+    /// A backwards jump larger than this in segment time means the recognizer
+    /// restarted for a new sentence (vs. a small in-window revision).
+    private static let resetJump: TimeInterval = 0.5
+    /// End the request and start a fresh one once this much audio has been fed,
+    /// comfortably before the recognizer's ~1 minute limit.
+    private static let rotateAfter: TimeInterval = 45
 
     /// A Sendable copy of one SFTranscriptionSegment.
     private struct SegmentData: Sendable {
@@ -93,11 +103,13 @@ final class SpeechTranscriber: TranscriptionService {
     func start(locale: Locale) throws {
         guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable else {
             let name = Locale.current.localizedString(forIdentifier: locale.identifier) ?? locale.identifier
+            Self.log.error("start: unavailable for \(locale.identifier, privacy: .public)")
             throw TranscriptionError.unavailableForLocale(name)
         }
         resetSession()
         self.recognizer = recognizer
-        beginRequest(startOffset: 0)
+        Self.log.notice("start: locale=\(locale.identifier, privacy: .public) onDevice=\(recognizer.supportsOnDeviceRecognition)")
+        beginRequest()
     }
 
     nonisolated func append(_ buffer: AVAudioPCMBuffer) {
@@ -111,13 +123,12 @@ final class SpeechTranscriber: TranscriptionService {
 
     func finish() async -> [Utterance] {
         guard task != nil else {
-            let collected = finalizedUtterances
+            let collected = committed
             resetSession()
             return collected
         }
 
         isFinishing = true
-        rotationPending = false
         let request = live.withLockUnchecked { state -> SFSpeechAudioBufferRecognitionRequest? in
             let current = state.request
             state.request = nil
@@ -125,39 +136,24 @@ final class SpeechTranscriber: TranscriptionService {
         }
         request?.endAudio()
 
-        // Wait for the final result, racing a ~2 second timeout.
+        // Wait for the final result, racing a ~3 second timeout.
         let gen = generation
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             finishContinuation = continuation
             Task { [weak self] in
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: .seconds(3))
                 guard let self, self.generation == gen else { return }
+                Self.log.notice("finish: final did not arrive in time; committing accumulated")
                 self.resolveFinish()
             }
         }
 
-        // No final result arrived in time: fold the volatile tail into a last
-        // utterance so nothing the user saw is lost.
-        let tail = snapshot.volatileText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tail.isEmpty {
-            let offset = requestOffsets[generation] ?? nextOffset
-            let utterance: Utterance
-            if let first = volatileSegments.first, let last = volatileSegments.last {
-                utterance = Utterance(
-                    text: tail,
-                    start: first.timestamp + offset,
-                    end: last.timestamp + last.duration + offset
-                )
-            } else {
-                utterance = Utterance(text: tail, start: offset, end: offset)
-            }
-            finalizedUtterances.append(utterance)
-            finalizedUtterances.sort { $0.start < $1.start }
-            snapshot.finalized = finalizedUtterances
-            snapshot.volatileText = ""
-        }
+        // Commit whatever the request accumulated — the full passage, not just
+        // the last partial — so nothing is lost even if the final timed out.
+        commitCurrent()
 
-        let collected = finalizedUtterances
+        let collected = committed
+        Self.log.notice("finish: returning \(collected.count) utterances")
         resetSession()
         return collected
     }
@@ -168,26 +164,21 @@ final class SpeechTranscriber: TranscriptionService {
 
     // MARK: - Recognition lifecycle
 
-    private func makeRequest() -> SFSpeechAudioBufferRecognitionRequest? {
-        guard let recognizer else { return nil }
+    private func beginRequest() {
+        guard let recognizer else { return }
+        generation += 1
+        let gen = generation
+        rotateRequested = false
+        stableSegments = []
+        chunkOffset = 0
+        livePartial = []
+
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.addsPunctuation = true
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
         }
-        return request
-    }
-
-    /// Starts a fresh live request + task beginning at `startOffset`. Used for
-    /// the first request and for the fallback (natural-final) rotation, where
-    /// there is no overlapping request to drain.
-    private func beginRequest(startOffset: TimeInterval) {
-        guard let recognizer, let request = makeRequest() else { return }
-        generation += 1
-        let gen = generation
-        requestOffsets[gen] = startOffset
-        rotationPending = false
         live.withLockUnchecked { state in
             state.request = request
             state.fedDuration = 0
@@ -195,41 +186,7 @@ final class SpeechTranscriber: TranscriptionService {
         task = recognizer.recognitionTask(with: request) { [weak self] result, error in
             self?.handleRecognition(generation: gen, result: result, error: error)
         }
-    }
-
-    /// Proactive, seamless rotation: publish a replacement request atomically
-    /// in place of the live one (so `append(_:)` never feeds a nil request and
-    /// no audio is dropped), advance the offset by the audio the old request
-    /// actually consumed, then end the old request so it drains its final.
-    private func rotate() {
-        guard let recognizer, let newRequest = makeRequest() else { return }
-        let oldGen = generation
-        let oldTask = task
-
-        generation += 1
-        let gen = generation
-
-        // Atomic swap: read what the old request consumed and install the new
-        // request in one lock acquisition.
-        let consumed = live.withLockUnchecked { state -> TimeInterval in
-            let fed = state.fedDuration
-            let old = state.request
-            state.request = newRequest
-            state.fedDuration = 0
-            // End the old request inside the lock so no further buffers reach
-            // it after the swap point.
-            old?.endAudio()
-            return fed
-        }
-
-        nextOffset += consumed
-        requestOffsets[gen] = nextOffset
-        rotationPending = false
-
-        if let oldTask { drainTasks[oldGen] = oldTask }
-        task = recognizer.recognitionTask(with: newRequest) { [weak self] result, error in
-            self?.handleRecognition(generation: gen, result: result, error: error)
-        }
+        Self.log.debug("beginRequest gen=\(gen) baseOffset=\(self.baseOffset, format: .fixed(precision: 1))")
     }
 
     /// Recognition callbacks arrive on an arbitrary queue: extract Sendable
@@ -245,8 +202,9 @@ final class SpeechTranscriber: TranscriptionService {
             SegmentData(text: segment.substring, timestamp: segment.timestamp, duration: segment.duration)
         } ?? []
         let failed = error != nil
+        let errorText = error?.localizedDescription
         Task { @MainActor [weak self] in
-            self?.apply(generation: gen, isFinal: isFinal, formattedText: formatted, segments: segments, failed: failed)
+            self?.apply(generation: gen, isFinal: isFinal, formattedText: formatted, segments: segments, failed: failed, errorText: errorText)
         }
     }
 
@@ -255,114 +213,93 @@ final class SpeechTranscriber: TranscriptionService {
         isFinal: Bool,
         formattedText: String,
         segments: [SegmentData],
-        failed: Bool
+        failed: Bool,
+        errorText: String?
     ) {
-        let isCurrent = (gen == generation)
-        // Accept callbacks for the live request or any still-draining request;
-        // ignore truly stale ones (e.g. after reset).
-        guard isCurrent || requestOffsets[gen] != nil else { return }
-
-        if isFinal {
-            // Fold this request's finalized stretch in at its own start offset,
-            // then retire it. A draining request keeps the live one untouched.
-            let offset = requestOffsets[gen] ?? nextOffset
-            finalizedUtterances.append(contentsOf: utterances(from: segments, offset: offset))
-            finalizedUtterances.sort { $0.start < $1.start }
-            requestOffsets[gen] = nil
-            drainTasks[gen] = nil
-            snapshot.finalized = finalizedUtterances
-
-            if isCurrent {
-                volatileSegments = []
-                snapshot.volatileText = ""
-                if isFinishing {
-                    resolveFinish()
-                } else {
-                    // The live request finalized on its own (no proactive
-                    // rotation happened in time); continue from the measured end.
-                    let consumed = live.withLockUnchecked { state -> TimeInterval in
-                        let fed = state.fedDuration
-                        state.request = nil
-                        return fed
-                    }
-                    nextOffset += consumed
-                    beginRequest(startOffset: nextOffset)
-                }
-            }
-            return
-        }
+        guard gen == generation else { return }
 
         if failed {
-            if isCurrent {
-                // An error here is usually a silence/pause timeout from
-                // on-device recognition — it must NOT drop the line already
-                // spoken. Fold the in-flight volatile in first, then keep
-                // transcribing with a fresh request so later speech is still
-                // captured (never stop mid-recording).
-                let offset = requestOffsets[gen] ?? nextOffset
-                if !volatileSegments.isEmpty {
-                    finalizedUtterances.append(contentsOf: utterances(from: volatileSegments, offset: offset))
-                    finalizedUtterances.sort { $0.start < $1.start }
-                    snapshot.finalized = finalizedUtterances
-                }
-                requestOffsets[gen] = nil
-                volatileSegments = []
-                snapshot.volatileText = ""
-                if isFinishing {
-                    resolveFinish()
-                } else {
-                    let consumed = live.withLockUnchecked { state -> TimeInterval in
-                        let fed = state.fedDuration
-                        state.request = nil
-                        return fed
-                    }
-                    nextOffset += consumed
-                    beginRequest(startOffset: nextOffset)
-                }
-            } else {
-                // A draining request errored before delivering its final;
-                // just retire it.
-                requestOffsets[gen] = nil
-                drainTasks[gen] = nil
-            }
+            Self.log.notice("recog gen=\(gen) ERROR \(errorText ?? "?", privacy: .public) — committing & continuing")
+            commitCurrent()
+            if isFinishing { resolveFinish() } else { advanceAndBegin() }
             return
         }
 
-        // Partial result: only the live request drives the volatile tail.
-        guard isCurrent else { return }
+        ingest(segments)
+        let full = livePassageSegments()
+        snapshot.volatileText = full.map(\.text).joined(separator: " ")
 
-        // On-device recognition can start a new utterance within the same
-        // request after a pause, restarting its segment timestamps and dropping
-        // the earlier words from later results. Detect that regression and fold
-        // the previous volatile in before it's overwritten, so nothing spoken
-        // before the pause is lost.
-        // A reset shows up as the transcript's extent going *backwards*: the
-        // newest result's last-segment time is well before the previous one's
-        // (a fresh utterance restarting near 0), rather than growing. The 0.2 s
-        // margin ignores the small revisions a cumulative result normally makes.
-        if let prevLast = volatileSegments.last,
-           let newLast = segments.last,
-           newLast.timestamp + 0.2 < prevLast.timestamp {
-            let offset = requestOffsets[gen] ?? nextOffset
-            finalizedUtterances.append(contentsOf: utterances(from: volatileSegments, offset: offset))
-            finalizedUtterances.sort { $0.start < $1.start }
-            snapshot.finalized = finalizedUtterances
-            // The new utterance's timestamps restart near 0; shift this
-            // request's offset forward so it lands after the folded text.
-            nextOffset = offset + prevLast.timestamp + prevLast.duration
-            requestOffsets[gen] = nextOffset
+        Self.log.debug("recog gen=\(gen) final=\(isFinal) segs=\(segments.count) accumulated=\(full.count) chars=\(self.snapshot.volatileText.count)")
+
+        if isFinal {
+            commitCurrent()
+            if isFinishing { resolveFinish() } else { advanceAndBegin() }
+            return
         }
 
-        volatileSegments = segments
-        snapshot.volatileText = formattedText
-
-        // Rotate proactively before the recognizer's ~1 minute limit. Segment
-        // timestamps are relative to this request's own audio.
-        if !rotationPending, !isFinishing,
-           let last = segments.last, last.timestamp > Self.rotationThreshold {
-            rotationPending = true
-            rotate()
+        // Rotate on real audio fed (not segment time), comfortably before the
+        // recognizer's ~1 minute limit.
+        let fed = live.withLockUnchecked { $0.fedDuration }
+        if !rotateRequested, !isFinishing, fed > Self.rotateAfter {
+            rotateRequested = true
+            Self.log.notice("rotate gen=\(gen) at fed=\(fed, format: .fixed(precision: 1))s")
+            live.withLockUnchecked { $0.request }?.endAudio()
         }
+    }
+
+    // MARK: - Segment accumulation
+
+    /// Folds a new partial's segments into the request's accumulated passage,
+    /// handling both the moving window (old words drop, timestamps grow) and a
+    /// reset (timestamps jump back for a new sentence).
+    private func ingest(_ segs: [SegmentData]) {
+        guard let newFirst = segs.first, let newLast = segs.last else { return }
+        if let prevLast = livePartial.last, newLast.timestamp + Self.resetJump < prevLast.timestamp {
+            // Reset: the previous partial is a completed chunk. Re-base it onto
+            // the running timeline and stash it; the new sentence starts after.
+            stableSegments.append(contentsOf: livePartial.map { rebased($0, by: chunkOffset) })
+            chunkOffset += prevLast.timestamp + prevLast.duration
+            livePartial = segs
+        } else {
+            // Window/cumulative: keep whatever we had before the new window,
+            // then take the new (revised) tail.
+            let kept = livePartial.filter { $0.timestamp < newFirst.timestamp - 0.01 }
+            livePartial = kept + segs
+        }
+    }
+
+    /// The current request's full passage so far, on one monotonic timeline.
+    private func livePassageSegments() -> [SegmentData] {
+        stableSegments + livePartial.map { rebased($0, by: chunkOffset) }
+    }
+
+    private func rebased(_ s: SegmentData, by offset: TimeInterval) -> SegmentData {
+        offset == 0 ? s : SegmentData(text: s.text, timestamp: s.timestamp + offset, duration: s.duration)
+    }
+
+    /// Folds the current request's full passage into the committed transcript.
+    private func commitCurrent() {
+        let full = livePassageSegments()
+        if !full.isEmpty {
+            committed.append(contentsOf: utterances(from: full, offset: baseOffset))
+            snapshot.finalized = committed
+        }
+        stableSegments = []
+        chunkOffset = 0
+        livePartial = []
+        snapshot.volatileText = ""
+    }
+
+    /// Advances the offset by the audio the just-ended request consumed and
+    /// starts the next request.
+    private func advanceAndBegin() {
+        let consumed = live.withLockUnchecked { state -> TimeInterval in
+            let fed = state.fedDuration
+            state.request = nil
+            return fed
+        }
+        baseOffset += consumed
+        beginRequest()
     }
 
     private func resolveFinish() {
@@ -374,18 +311,16 @@ final class SpeechTranscriber: TranscriptionService {
         generation += 1
         task?.cancel()
         task = nil
-        for drained in drainTasks.values { drained.cancel() }
-        drainTasks = [:]
         recognizer = nil
         live.withLockUnchecked { $0 = LiveState() }
-        nextOffset = 0
-        requestOffsets = [:]
-        finalizedUtterances = []
-        volatileSegments = []
-        rotationPending = false
+        committed = []
+        stableSegments = []
+        chunkOffset = 0
+        livePartial = []
+        baseOffset = 0
+        rotateRequested = false
         isFinishing = false
         snapshot = TranscriptSnapshot()
-        // Never strand a waiter (e.g. cancel() during finish()).
         finishContinuation?.resume()
         finishContinuation = nil
     }

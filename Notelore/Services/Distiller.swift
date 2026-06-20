@@ -1,4 +1,5 @@
 import Foundation
+import SwiftData
 
 /// Turns a finished session's transcript into its Minutes (a Note).
 @MainActor
@@ -19,6 +20,10 @@ final class Distiller {
             throw LLMError.unparseableResponse("Transcript is empty.")
         }
         let distilled = try await llm.distill(transcript: transcript)
+        // The session may have been deleted while the request was in flight
+        // (background distillation can outlive a swipe-to-delete). Writing to a
+        // removed SwiftData model would crash, so bail if it's gone.
+        guard session.modelContext != nil else { return }
         store.attach(distilled, to: session)
     }
 

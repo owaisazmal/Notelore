@@ -50,6 +50,33 @@ struct PrepGuide: Codable, Equatable, Sendable {
     var talkingPoints: [String]
 }
 
+/// A live "margin note" on the conversation as it is being recorded: a concise
+/// definition of a meaningful term, or a brief neutral answer/context for a
+/// question raised. A comprehension aid — never advice on what to say back.
+struct MarginNote: Identifiable, Equatable, Sendable {
+    let id: UUID
+    /// The term being defined, or the question being answered.
+    let headword: String
+    /// The definition, or the brief answer / background.
+    let note: String
+    /// True when `headword` is a question raised in the conversation.
+    let isQuestion: Bool
+
+    init(id: UUID = UUID(), headword: String, note: String, isQuestion: Bool) {
+        self.id = id
+        self.headword = headword
+        self.note = note
+        self.isQuestion = isQuestion
+    }
+}
+
+/// Wire shape for one margin note, before an id is attached.
+struct MarginNoteData: Codable, Equatable, Sendable {
+    var headword: String
+    var note: String
+    var isQuestion: Bool
+}
+
 /// Errors surfaced to the UI in the app's calm editorial voice.
 enum LLMError: LocalizedError, Equatable {
     case missingKey
@@ -92,4 +119,9 @@ protocol LLMService: AnyObject {
     /// A study guide from a pasted job description or agenda. Preparation
     /// and practice beforehand only.
     func prepGuide(from brief: String) async throws -> PrepGuide
+    /// Live margin notes for an in-progress transcript: definitions of the
+    /// meaningful terms and brief, neutral answers/context for questions
+    /// raised. `covered` lists headwords already shown, so only new notes come
+    /// back. A comprehension aid; never coaching on what to say.
+    func marginNotes(forTranscript transcript: String, covered: [String]) async throws -> [MarginNote]
 }

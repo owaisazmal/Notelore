@@ -25,23 +25,20 @@ struct KeychainStore: Sendable {
 
     func setAPIKey(_ key: String, for provider: LLMProviderID) {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else {
-            deleteAPIKey(for: provider)
-            return
-        }
-        let query: [String: Any] = [
+        // Clear any existing entr(ies) first, then add exactly one. This
+        // reliable upsert avoids stale or duplicate keychain items, which can
+        // otherwise read back empty and make a saved key look absent until a
+        // validate rewrites it.
+        deleteAPIKey(for: provider)
+        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return }
+        let attributes: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: provider.rawValue,
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
-        let update: [String: Any] = [kSecValueData as String: data]
-        let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
-        if status == errSecItemNotFound {
-            var add = query
-            add[kSecValueData as String] = data
-            add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            SecItemAdd(add as CFDictionary, nil)
-        }
+        SecItemAdd(attributes as CFDictionary, nil)
     }
 
     func deleteAPIKey(for provider: LLMProviderID) {

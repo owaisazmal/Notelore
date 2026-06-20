@@ -24,6 +24,12 @@ final class AppSettings {
     var hasAcknowledgedRecordingConsent: Bool {
         didSet { defaults.set(hasAcknowledgedRecordingConsent, forKey: Keys.consent) }
     }
+    /// Whether the live "Margin notes" overlay runs while recording. On by
+    /// default; it only calls the service while you actually watch the notes,
+    /// and can be turned off here if the key's quota gets tight.
+    var liveMarginNotesEnabled: Bool {
+        didSet { defaults.set(liveMarginNotesEnabled, forKey: Keys.liveMarginNotes) }
+    }
 
     var transcriptionLocale: Locale { Locale(identifier: transcriptionLocaleID) }
 
@@ -35,17 +41,22 @@ final class AppSettings {
         self.transcriptionLocaleID = defaults.string(forKey: Keys.transcriptionLocaleID)
             ?? Locale.current.identifier
         self.hasAcknowledgedRecordingConsent = defaults.bool(forKey: Keys.consent)
+        // On unless explicitly turned off, so it's on for fresh and existing
+        // installs alike but still respects a deliberate off.
+        self.liveMarginNotesEnabled = defaults.object(forKey: Keys.liveMarginNotes) as? Bool ?? true
     }
 
     func resetAll() {
         geminiModel = Self.geminiModels[0]
         transcriptionLocaleID = Locale.current.identifier
         hasAcknowledgedRecordingConsent = false
+        liveMarginNotesEnabled = true
     }
 
     private enum Keys {
         static let geminiModel = "settings.geminiModel"
         static let transcriptionLocaleID = "settings.transcriptionLocaleID"
         static let consent = "settings.hasAcknowledgedRecordingConsent"
+        static let liveMarginNotes = "settings.liveMarginNotesEnabled"
     }
 }

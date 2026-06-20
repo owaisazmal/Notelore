@@ -15,12 +15,14 @@ final class AppServices {
     let llm: any LLMService
     let notesStore: NotesStore
     let distiller: Distiller
+    let processing: ProcessingCoordinator
 
     init(modelContainer: ModelContainer) {
         let settings = AppSettings()
         let keychain = KeychainStore()
         let llm = GeminiService(keychain: keychain, settings: settings)
         let notesStore = NotesStore(context: modelContainer.mainContext)
+        let distiller = Distiller(llm: llm, store: notesStore)
 
         self.settings = settings
         self.keychain = keychain
@@ -28,6 +30,7 @@ final class AppServices {
         self.transcriber = SpeechTranscriber()
         self.llm = llm
         self.notesStore = notesStore
-        self.distiller = Distiller(llm: llm, store: notesStore)
+        self.distiller = distiller
+        self.processing = ProcessingCoordinator(distiller: distiller)
     }
 }
